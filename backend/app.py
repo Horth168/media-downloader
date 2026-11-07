@@ -88,10 +88,11 @@ def _selftest(app):
             m = j["media"]
             log.warning("SELFTEST %s -> OK %s, %d items: %s", url, m["kind"], len(m["items"]),
                         json.dumps([[it["type"], [f["id"] for f in it["formats"]]] for it in m["items"]])[:300])
-            f = m["items"][0]["formats"][0]
-            d = client.get("/api/download?t=" + f["ticket"])
-            log.warning("SELFTEST download %s -> %s %s %d bytes", f["filename"], d.status_code,
-                        d.headers.get("Content-Type"), len(d.data))
+            for it in m["items"][:4]:
+                for f in it["formats"][-1:] if it["type"] == "video" else it["formats"][:1]:
+                    d = client.get("/api/download?t=" + f["ticket"])
+                    log.warning("SELFTEST download %s -> %s %s %d bytes", f["filename"], d.status_code,
+                                d.headers.get("Content-Type"), len(d.data))
 
     threading.Thread(target=run, daemon=True).start()
 
