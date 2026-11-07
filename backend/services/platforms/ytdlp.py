@@ -267,7 +267,7 @@ class YouTube(YtdlpPlatform):
     domains = ("youtube.com", "youtu.be", "youtube-nocookie.com")
     extractors = ("youtube",)
     # Other YouTube clients sometimes slip past the bot check when the default one is blocked.
-    fallback_clients = (["tv", "web_safari"], ["mweb"], ["android_vr"])
+    fallback_clients = (["android_vr"], ["tv"], ["mweb"], ["web_safari"])
 
     def extract(self, url):
         try:
@@ -601,7 +601,9 @@ def download_to(workdir, ticket):
         except (DownloadError, ExtractorError) as e:
             err = e
             low = str(e).lower()
-            if pid != "youtube" or not ("not a bot" in low or "sign in" in low or "format" in low):
+            retriable = ("not a bot", "sign in", "format", "empty", "403", "forbidden", "unable to download",
+                         "fragment", "http error")
+            if pid != "youtube" or not any(k in low for k in retriable):
                 break
             log.info("YouTube download attempt failed (%s): %s",
                      (attempt.get("extractor_args") or {}).get("youtube"), str(e)[:120])
