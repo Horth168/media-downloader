@@ -396,34 +396,94 @@ class TikTok(YtdlpPlatform):
         if not m:
             raise ApiError("invalid_url", "That doesn't look like a TikTok post link.", 400)
         post_id = m.group(1)
+        um = re.search(r"/@([\w.-]+)/", url)
+        user = um.group(1) if um else "_"
+        candidates = [f"https://www.tiktok.com/@{user}/video/{post_id}",
+                      f"https://www.tiktok.com/@{user}/photo/{post_id}"]
+
+        images, title, author, music = [], None, None, None
         with yt_dlp.YoutubeDL(ydl_opts(self.extractors)) as ydl:
             ie = ydl.get_info_extractor("TikTok")
-            try:
-                item, status = ie._extract_web_data_and_status(url, post_id)
-            except (DownloadError, ExtractorError) as e:
-                raise friendly_error(self.name, e)
-        if status in (10216, 10222):
-            raise ApiError("private", "That TikTok post is private, so it can't be downloaded.", 403)
-        if status == 10204:
-            raise ApiError("blocked_by_platform", "TikTok is blocking our server for this post. Try again later.", 503)
-        if not item:
-            log.warning("TikTok photo post %s: no data (status %s)", post_id, status)
-            raise ApiError("not_found", "That TikTok post was removed, is private, or couldn't be read.", 404)
 
-        def best_url(img):
-            urls = (img.get("imageURL") or {}).get("urlList") or []
-            return next((u for u in urls if "jpeg" in u or ".jpg" in u), urls[0] if urls else None)
+            # Route 1 + 2: the web page (yt-dlp handles TikTok's challenge cookie).
+            for cand in candidates:
+                try:
+                    item, status = ie._extract_web_data_and_status(cand, post_id, fatal=False)
+                except (DownloadError, ExtractorError) as e:
+                    log.info("TikTok web data failed for %s: %s", cand, str(e)[:160])
+                    item, status = None, -1
+                if status in (10216, 10222):
+                    raise ApiError("private", "That TikTok post is private, so it can't be downloaded.", 403)
+                found = _find_image_post(item)
+                if not found:
+                    try:
+                        page = ie._download_webpage(cand, post_id, note=False, fatal=False, impersonate=True,
+                                                    headers=ie._generate_blockbuster_headers())
+                        data = ie._get_universal_data(page, post_id) if page else {}
+                        log.info("TikTok page %s scopes: %s", cand, list(data)[:12])
+                        found = _find_image_post(data)
+                    except (DownloadError, ExtractorError) as e:
+                        log.info("TikTok page fetch failed for %s: %s", cand, str(e)[:160])
+                if found:
+                    images = [u for u in (_pick_jpeg((i.get("imageURL") or {}).get("urlList"))
+                                          for i in found["imagePost"]["images"]) if u]
+                    title = found.get("desc")
+                    author = (found.get("author") or {}).get("uniqueId")
+                    music = (found.get("music") or {}).get("playUrl")
+                    break
 
-        images = [u for u in (best_url(i) for i in (item.get("imagePost") or {}).get("images", [])) if u]
+            # Route 3: TikTok's app API.
+            if not images:
+                try:
+                    from yt_dlp.utils import urlencode_postdata
+                    res = ie._call_api("multi/aweme/detail", post_id, data=urlencode_postdata({
+                        "aweme_ids": f"[{post_id}]", "request_source": "0"}), headers={"X-Argus": ""})
+                    aweme = ((res or {}).get("aweme_details") or [None])[0] or {}
+                    imgs = (aweme.get("image_post_info") or {}).get("images") or []
+                    images = [u for u in (_pick_jpeg((i.get("display_image") or {}).get("url_list"))
+                                          for i in imgs) if u]
+                    title = aweme.get("desc")
+                    author = (aweme.get("author") or {}).get("unique_id")
+                    music = (((aweme.get("music") or {}).get("play_url") or {}).get("url_list") or [None])[0]
+                    log.info("TikTok app API for %s: %d images", post_id, len(images))
+                except Exception as e:  # noqa: BLE001 — best effort
+                    log.info("TikTok app API failed for %s: %s", post_id, str(e)[:160])
+
         if not images:
-            raise ApiError("not_found", "That TikTok post has no photos.", 404)
-        title = (item.get("desc") or f"tiktok_{post_id}").splitlines()[0][:70]
+            log.warning("TikTok photo post %s: no images found by any route", post_id)
+            raise ApiError("extract_failed", "TikTok didn't give our server the photos for this post. "
+                                             "Try again in a minute.", 502)
+        title = (title or f"tiktok_{post_id}").splitlines()[0][:70]
         items = _image_items(images, title, self.cdn_headers)
-        music = (item.get("music") or {}).get("playUrl")
         if music:
             items.append(_audio_direct_item(music, title, self.cdn_headers))
-        return {"title": title, "author": (item.get("author") or {}).get("uniqueId"),
-                "thumbnail": images[0], "kind": "carousel" if len(items) > 1 else "image", "items": items}
+        return {"title": title, "author": author, "thumbnail": images[0],
+                "kind": "carousel" if len(items) > 1 else "image", "items": items}
+
+
+def _pick_jpeg(urls):
+    urls = urls or []
+    return next((u for u in urls if "jpeg" in u or ".jpg" in u), urls[0] if urls else None)
+
+
+def _find_image_post(obj, depth=0):
+    """Find the first dict holding a non-empty imagePost anywhere in TikTok's page data."""
+    if depth > 8 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        ip = obj.get("imagePost")
+        if isinstance(ip, dict) and ip.get("images"):
+            return obj
+        for v in obj.values():
+            r = _find_image_post(v, depth + 1)
+            if r:
+                return r
+    elif isinstance(obj, list):
+        for v in obj[:50]:
+            r = _find_image_post(v, depth + 1)
+            if r:
+                return r
+    return None
 
 
 class Douyin(YtdlpPlatform):

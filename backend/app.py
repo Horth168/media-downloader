@@ -65,8 +65,40 @@ def create_app():
     return app
 
 
+def _selftest(app):
+    """If SELFTEST_URLS is set, analyze those links (and fetch the first file) at startup and log the result."""
+    import json
+    import threading
+    import time
+
+    urls = [u.strip() for u in os.environ.get("SELFTEST_URLS", "").split(",") if u.strip()]
+    if not urls:
+        return
+
+    def run():
+        time.sleep(3)
+        log = logging.getLogger("selftest")
+        client = app.test_client()
+        for url in urls:
+            r = client.post("/api/analyze", json={"url": url})
+            j = r.get_json() or {}
+            if not j.get("ok"):
+                log.warning("SELFTEST %s -> %s %s: %s", url, r.status_code, j.get("error"), j.get("message"))
+                continue
+            m = j["media"]
+            log.warning("SELFTEST %s -> OK %s, %d items: %s", url, m["kind"], len(m["items"]),
+                        json.dumps([[it["type"], [f["id"] for f in it["formats"]]] for it in m["items"]])[:300])
+            f = m["items"][0]["formats"][0]
+            d = client.get("/api/download?t=" + f["ticket"])
+            log.warning("SELFTEST download %s -> %s %s %d bytes", f["filename"], d.status_code,
+                        d.headers.get("Content-Type"), len(d.data))
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 logging.basicConfig(level=logging.INFO)
 app = create_app()
+_selftest(app)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
