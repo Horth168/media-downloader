@@ -119,10 +119,23 @@ def friendly_error(platform_name, err):
     return ApiError("extract_failed", f"Couldn't read that {platform_name} post. Try again in a moment.", 502)
 
 
-def _height_selector(h):
-    # Prefer H.264 + AAC: plays everywhere, including iPhone Photos. Others get converted after download.
-    return (f"bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<={h}][vcodec^=avc1]/"
-            f"bv*[height<={h}]+ba/b[height<={h}]/b")
+H264 = "[vcodec~='^(avc|h264)']"
+
+
+def _height_selector(h, platform=None):
+    """Pick a format at or below height h, always with sound.
+
+    * separate video + audio tracks are merged (bv*+ba) whenever an audio track exists,
+      so posts that keep sound in its own track don't come out silent
+    * H.264 is preferred (plays in iPhone Photos without converting); others get converted
+    * Facebook's ready-made hd/sd files come first: no merging or converting needed
+    """
+    parts = []
+    if platform == "facebook":
+        parts.append("b[format_id^=hd]" if h >= 720 else "b[format_id^=sd]/b[format_id^=hd]")
+    parts += [f"bv*[height<={h}]{H264}+ba", f"bv*[height<={h}]+ba",
+              f"b[height<={h}]{H264}", f"b[height<={h}]", "b"]
+    return "/".join(parts)
 
 
 def _estimate_size(formats, h):
@@ -146,6 +159,17 @@ def _audio_size(formats):
     a = max(auds, key=lambda f: f.get("tbr") or 0)
     s = a.get("filesize") or a.get("filesize_approx")
     return int(s) if s else None
+
+
+def _log_formats(name, info):
+    """One compact line per post: which formats the platform offered (id:vcodec/acodec@height)."""
+    try:
+        node = (info.get("entries") or [info])[0] or {}
+        fm = [f"{f.get('format_id')}:{(f.get('vcodec') or '?')[:6]}/{(f.get('acodec') or '?')[:6]}@{f.get('height')}"
+              for f in (node.get("formats") or [])][-14:]
+        log.info("%s formats: %s", name, " ".join(fm))
+    except Exception:  # noqa: BLE001 — logging only
+        pass
 
 
 class YtdlpPlatform(Platform):
@@ -173,9 +197,11 @@ class YtdlpPlatform(Platform):
     def extract(self, url):
         try:
             with yt_dlp.YoutubeDL(ydl_opts(self.extractors, skip_download=True)) as ydl:
-                return ydl.sanitize_info(ydl.extract_info(url, download=False))
+                info = ydl.sanitize_info(ydl.extract_info(url, download=False))
         except (DownloadError, ExtractorError) as e:
             raise friendly_error(self.name, e)
+        _log_formats(self.name, info)
+        return info
 
     def media_from_info(self, info, page_url):
         entries = info.get("entries")
@@ -211,7 +237,7 @@ class YtdlpPlatform(Platform):
             if top and top not in QUALITIES and top < 1080 and top not in levels:
                 levels = [top] + levels[:2]
             for h in levels:
-                sel = _height_selector(h) if h else "b[vcodec^=avc1]/bv*[vcodec^=avc1]+ba/b/bv*+ba"
+                sel = _height_selector(h, self.id) if h else f"bv*{H264}+ba/bv*+ba/b"
                 label_q = f"{h}p" if h else "Best available"
                 out.append(self._fmt(f"mp4-{h or 'best'}", "MP4 Video", label_q, "mp4",
                                      _estimate_size(formats, h) if h else None,
@@ -579,6 +605,9 @@ def download_to(workdir, ticket):
         max_filesize=Config.MAX_DOWNLOAD_MB * 1024 * 1024,
         overwrites=True,
         format_sort=["vcodec:h264", "acodec:aac"],
+        # Instagram doesn't say whether its video files carry sound; letting yt-dlp merge the
+        # separate audio track anyway avoids silent videos (the phone-friendly step keeps one track).
+        allow_multiple_audio_streams=True,
     )
     if ticket.get("c"):
         opts["extractor_args"] = {"youtube": {"player_client": ticket["c"]}}
