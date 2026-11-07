@@ -65,6 +65,19 @@ def create_app():
     return app
 
 
+def _mem():
+    """Memory report: this process's peak, ffmpeg's peak, and the container's current/peak usage."""
+    import resource
+    parts = [f"py_peak={resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}MB",
+             f"child_peak={resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss // 1024}MB"]
+    for name in ("memory.current", "memory.peak"):
+        try:
+            parts.append(f"cg_{name.split('.')[1]}={int(open('/sys/fs/cgroup/' + name).read()) // 1048576}MB")
+        except (OSError, ValueError):
+            pass
+    return " ".join(parts)
+
+
 def _selftest(app):
     """If SELFTEST_URLS is set, analyze those links (and fetch the first file) at startup and log the result."""
     import json
@@ -80,6 +93,7 @@ def _selftest(app):
         log = logging.getLogger("selftest")
         client = app.test_client()
         for url in urls:
+            log.warning("SELFTEST start %s | %s", url, _mem())
             r = client.post("/api/analyze", json={"url": url})
             j = r.get_json() or {}
             if not j.get("ok"):
@@ -100,14 +114,21 @@ def _selftest(app):
                             tmp.write(d.data)
                             tmp.flush()
                             codecs = "codecs=%s/%s" % _probe_codecs(tmp.name)
-                    log.warning("SELFTEST download %s -> %s %s %d bytes %s", f["filename"], d.status_code,
-                                d.headers.get("Content-Type"), len(d.data), codecs)
+                    log.warning("SELFTEST download %s -> %s %s %d bytes %s | %s", f["filename"], d.status_code,
+                                d.headers.get("Content-Type"), len(d.data), codecs, _mem())
 
     threading.Thread(target=run, daemon=True).start()
 
 
 logging.basicConfig(level=logging.INFO)
 app = create_app()
+try:  # one-line environment report, helps diagnose memory/disk limits on the host
+    import tempfile
+    mounts = open("/proc/mounts").read().splitlines()
+    tmp_mount = [m for m in mounts if " /tmp " in m] or ["(no separate /tmp mount)"]
+    logging.getLogger("env").warning("ENV tmpdir=%s mount=%s cwd=%s", tempfile.gettempdir(), tmp_mount[0], os.getcwd())
+except Exception:  # noqa: BLE001
+    pass
 _selftest(app)
 
 if __name__ == "__main__":

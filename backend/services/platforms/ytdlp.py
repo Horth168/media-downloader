@@ -63,7 +63,8 @@ def cookie_file():
         return None
     if _cookie_file and os.path.exists(_cookie_file):
         return _cookie_file
-    fd, path = tempfile.mkstemp(prefix="fetchly-cookies-", suffix=".txt")
+    from services.downloader import WORK_ROOT
+    fd, path = tempfile.mkstemp(prefix="fetchly-cookies-", suffix=".txt", dir=WORK_ROOT)
     with os.fdopen(fd, "w") as f:
         f.write(Config.YTDLP_COOKIES.replace("\\n", "\n"))
     _cookie_file = path
@@ -81,6 +82,8 @@ def ydl_opts(extractors, **extra):
         "allowed_extractors": list(extractors),
         "js_runtimes": {"deno": {}, "node": {}},
         "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        "buffersize": 64 * 1024,
+        "http_chunk_size": 10 * 1024 * 1024,
     }
     cf = cookie_file()
     if cf:
@@ -523,12 +526,16 @@ class Douyin(YtdlpPlatform):
         r.close()
         m = re.search(r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", html, re.S)
         if not m:
+            t = re.search(r"<title>(.*?)</title>", html, re.S)
+            log.warning("Douyin share page %s: no _ROUTER_DATA (final=%s, %d bytes, title=%r)",
+                        aid, r.url, len(html), (t.group(1).strip()[:80] if t else None))
             raise ApiError("extract_failed", "Couldn't read that Douyin post. Try again in a moment.", 502)
         try:
             loader = json.loads(m.group(1))["loaderData"]
             res = next(v["videoInfoRes"] for v in loader.values() if isinstance(v, dict) and v.get("videoInfoRes"))
             item = res["item_list"][0]
-        except (ValueError, KeyError, StopIteration, IndexError, TypeError):
+        except (ValueError, KeyError, StopIteration, IndexError, TypeError) as e:
+            log.warning("Douyin share page %s: unexpected data (%s: %s)", aid, type(e).__name__, str(e)[:120])
             raise ApiError("not_found", "That Douyin post was removed, is private, or couldn't be read.", 404)
 
         title = (item.get("desc") or f"douyin_{aid}").splitlines()[0][:70]
@@ -582,7 +589,9 @@ def download_to(workdir, ticket):
     if pid == "youtube":
         # The bot check can hit any client at any time — try the others before giving up.
         tried = ticket.get("c")
-        for clients in [None, *YouTube.fallback_clients]:
+        # Without cookies every client usually hits the same block; don't make people wait for all of them.
+        candidates = [None, *YouTube.fallback_clients] if Config.YTDLP_COOKIES else [None, ["android_vr"]]
+        for clients in candidates:
             if clients == tried:
                 continue
             alt = dict(opts)

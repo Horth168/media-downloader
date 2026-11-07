@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from urllib.parse import quote
 
@@ -23,6 +24,22 @@ from services.netguard import safe_request
 log = logging.getLogger(__name__)
 CHUNK = 64 * 1024
 TMP_PREFIX = "mdl-"
+# Work files go on disk next to the app, not in /tmp: on some hosts /tmp is RAM-backed,
+# so a few large videos there would count against the memory limit and crash the server.
+WORK_ROOT = os.environ.get("WORK_DIR") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".work")
+os.makedirs(WORK_ROOT, exist_ok=True)
+# Downloads/conversions are memory- and CPU-heavy; on a small server run one at a time.
+HEAVY = threading.BoundedSemaphore(int(os.environ.get("MAX_PARALLEL_JOBS", "1")))
+
+
+class _heavy_slot:
+    def __enter__(self):
+        if not HEAVY.acquire(timeout=240):
+            raise ApiError("busy", "The server is busy with other downloads. Try again in a minute.", 503)
+
+    def __exit__(self, *exc):
+        HEAVY.release()
 CONTENT_TYPES = {"mp4": "video/mp4", "webm": "video/webm", "mkv": "video/x-matroska", "mov": "video/quicktime",
                  "m4a": "audio/mp4", "mp3": "audio/mpeg", "opus": "audio/ogg", "ogg": "audio/ogg",
                  "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
@@ -37,7 +54,7 @@ def _ffmpeg_exe():
 
 
 def cleanup_stale_temp(max_age=3600):
-    root = tempfile.gettempdir()
+    root = WORK_ROOT
     now = time.time()
     for name in os.listdir(root):
         if name.startswith(TMP_PREFIX):
@@ -56,7 +73,7 @@ def _disposition(filename):
 
 def _new_workdir():
     cleanup_stale_temp()
-    return tempfile.mkdtemp(prefix=TMP_PREFIX)
+    return tempfile.mkdtemp(prefix=TMP_PREFIX, dir=WORK_ROOT)
 
 
 def _open_upstream(url, headers=None):
@@ -105,7 +122,7 @@ def _to_mp3(src, out):
     try:
         proc = subprocess.run(
             [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-             "-i", src, "-vn", "-map", "a:0?", "-c:a", "libmp3lame", "-q:a", "2", out],
+             "-i", src, "-vn", "-map", "a:0?", "-c:a", "libmp3lame", "-q:a", "2", "-threads", "1", out],
             capture_output=True, timeout=240,
         )
     except subprocess.TimeoutExpired:
@@ -141,14 +158,19 @@ def make_phone_friendly(path, workdir):
     elif v == "hevc":
         vargs = ["-c:v", "copy", "-tag:v", "hvc1"]  # iOS only plays HEVC tagged hvc1
     else:
-        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"]
+        # Few threads + short lookahead keeps memory low on a 512 MB server.
+        # Only reached for VP9/AV1 sources (H.264 is preferred when downloading). Capped at 720p,
+        # one thread and a short lookahead so it fits in a 512 MB server.
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+                 "-threads", "1", "-x264-params", "rc-lookahead=8:sync-lookahead=0",
+                 "-vf", "scale='if(gt(ih,iw),min(720,iw),-2)':'if(gt(ih,iw),-2,min(720,ih))'"]
     if a is None:
         aargs = []
     elif a == "aac":
         aargs = ["-c:a", "copy"]
     else:
         aargs = ["-c:a", "aac", "-b:a", "160k"]
-    cmd = [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path,
+    cmd = [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-threads", "1", "-i", path,
            "-map", "0:v:0", "-map", "0:a:0?", *vargs, *aargs, "-movflags", "+faststart", out]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=900)
@@ -192,23 +214,25 @@ def _stream_file(path, workdir, filename):
 def stream_mp3(url, filename, headers=None):
     workdir = _new_workdir()
     try:
-        src = os.path.join(workdir, "source")
-        out = os.path.join(workdir, "audio.mp3")
-        limit = Config.MAX_CONVERT_MB * 1024 * 1024
-        resp = _open_upstream(url, headers)
-        try:
-            written = 0
-            with open(src, "wb") as f:
-                for chunk in resp.iter_content(CHUNK):
-                    written += len(chunk)
-                    if written > limit:
-                        raise ApiError("too_large",
-                                       f"MP3 conversion is limited to files under {Config.MAX_CONVERT_MB} MB.", 413)
-                    f.write(chunk)
-        finally:
-            resp.close()
-        _to_mp3(src, out)
-        os.remove(src)
+        with _heavy_slot():
+            src = os.path.join(workdir, "source")
+            out = os.path.join(workdir, "audio.mp3")
+            limit = Config.MAX_CONVERT_MB * 1024 * 1024
+            resp = _open_upstream(url, headers)
+            try:
+                written = 0
+                with open(src, "wb") as f:
+                    for chunk in resp.iter_content(CHUNK):
+                        written += len(chunk)
+                        if written > limit:
+                            raise ApiError("too_large",
+                                           f"MP3 conversion is limited to files under {Config.MAX_CONVERT_MB} MB.",
+                                           413)
+                        f.write(chunk)
+            finally:
+                resp.close()
+            _to_mp3(src, out)
+            os.remove(src)
     except Exception:
         shutil.rmtree(workdir, ignore_errors=True)
         raise
@@ -220,17 +244,18 @@ def stream_platform(ticket):
     from services.platforms.ytdlp import download_to  # local import keeps startup light
     workdir = _new_workdir()
     try:
-        path = download_to(workdir, ticket)
-        if ticket["m"] == "mp3" and not path.lower().endswith(".mp3"):
-            if os.path.getsize(path) > Config.MAX_CONVERT_MB * 1024 * 1024:
-                raise ApiError("too_large",
-                               f"MP3 conversion is limited to files under {Config.MAX_CONVERT_MB} MB.", 413)
-            out = os.path.join(workdir, "audio.mp3")
-            _to_mp3(path, out)
-            os.remove(path)
-            path = out
-        elif ticket["m"] == "video":
-            path = make_phone_friendly(path, workdir)
+        with _heavy_slot():
+            path = download_to(workdir, ticket)
+            if ticket["m"] == "mp3" and not path.lower().endswith(".mp3"):
+                if os.path.getsize(path) > Config.MAX_CONVERT_MB * 1024 * 1024:
+                    raise ApiError("too_large",
+                                   f"MP3 conversion is limited to files under {Config.MAX_CONVERT_MB} MB.", 413)
+                out = os.path.join(workdir, "audio.mp3")
+                _to_mp3(path, out)
+                os.remove(path)
+                path = out
+            elif ticket["m"] == "video":
+                path = make_phone_friendly(path, workdir)
     except Exception:
         shutil.rmtree(workdir, ignore_errors=True)
         raise

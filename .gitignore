@@ -18,3 +18,4 @@ dev-dist/
 .DS_Store
 .vscode/
 .idea/
+backend/.work/
