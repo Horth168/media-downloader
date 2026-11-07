@@ -546,8 +546,28 @@ class Douyin(YtdlpPlatform):
             except ApiError:
                 raise first
 
+    SHARE_VARIANTS = (
+        ("https://www.iesdouyin.com/share/video/{aid}/", MOBILE_UA),
+        ("https://m.douyin.com/share/video/{aid}/", MOBILE_UA),
+        ("https://www.iesdouyin.com/share/video/{aid}/?region=CN&from=web_code_link",
+         "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) "
+         "Chrome/126.0 Mobile Safari/537.36 MicroMessenger/8.0.47"),
+        ("https://www.iesdouyin.com/share/note/{aid}/", MOBILE_UA),
+    )
+
     def share_page(self, aid):
-        r = safe_request(f"https://www.iesdouyin.com/share/video/{aid}/", headers={"User-Agent": MOBILE_UA})
+        last = None
+        for url_t, ua in self.SHARE_VARIANTS:
+            try:
+                media = self._share_page_once(aid, url_t.format(aid=aid), ua)
+                log.info("Douyin %s read via %s", aid, url_t)
+                return media
+            except ApiError as e:
+                last = e
+        raise last
+
+    def _share_page_once(self, aid, url, ua):
+        r = safe_request(url, headers={"User-Agent": ua, "Referer": "https://www.douyin.com/"})
         html = r.text
         r.close()
         m = re.search(r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", html, re.S)
@@ -562,7 +582,7 @@ class Douyin(YtdlpPlatform):
             res = next((v["videoInfoRes"] for v in loader.values() if isinstance(v, dict) and v.get("videoInfoRes")),
                        None)
             if res is None or not res.get("item_list"):
-                log.warning("Douyin share page %s: loaderData=%s videoInfoRes=%s", aid, json.dumps(shape)[:600],
+                log.warning("Douyin share page %s (%s): loaderData=%s videoInfoRes=%s", aid, url, json.dumps(shape)[:300],
                             json.dumps(res)[:300] if res else None)
                 raise StopIteration
             item = res["item_list"][0]
