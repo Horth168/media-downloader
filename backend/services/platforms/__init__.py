@@ -1,9 +1,8 @@
 from services.platforms.direct import DirectLink
-from services.platforms.meta import Facebook, Instagram
-from services.platforms.unsupported import Douyin, TikTok, YouTube
+from services.platforms.ytdlp import Douyin, Facebook, Instagram, TikTok, YouTube
 
 # Order matters: specific platforms first, generic direct links last.
-PLATFORMS = [YouTube(), TikTok(), Douyin(), Instagram(), Facebook()]
+PLATFORMS = [TikTok(), Douyin(), Instagram(), Facebook(), YouTube()]
 DIRECT = DirectLink()
 
 

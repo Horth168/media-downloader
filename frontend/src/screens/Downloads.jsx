@@ -40,11 +40,12 @@ export default function Downloads({ go }) {
 function JobRow({ job }) {
   const { cancel, retry, dismiss } = useApp()
   const active = ['queued', 'downloading', 'saving'].includes(job.status)
-  const pct = job.total ? Math.min(100, Math.round((job.loaded / job.total) * 100)) : null
+  const pct = job.total && job.loaded ? Math.min(100, Math.round((job.loaded / job.total) * 100)) : null
   const isZip = job.kind === 'zip'
 
   let line
   if (job.status === 'queued') line = 'Starting…'
+  else if (job.status === 'downloading' && !isZip && !job.loaded) line = 'Preparing on server, this can take a minute'
   else if (job.status === 'downloading') {
     line = isZip
       ? `${job.loaded} of ${job.total} files`
@@ -79,7 +80,7 @@ function JobRow({ job }) {
       {active && (
         <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-graphite" role="progressbar"
              aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct ?? undefined}>
-          {pct != null && job.status === 'downloading'
+          {pct != null && job.loaded > 0 && job.status === 'downloading'
             ? <div className="h-full rounded-full bg-gradient-to-r from-violet to-azure transition-[width] duration-200" style={{ width: `${pct}%` }} />
             : <div className="shimmer h-full w-full" />}
         </div>

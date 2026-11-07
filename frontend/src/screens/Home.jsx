@@ -143,7 +143,6 @@ export default function Home({ go, sharedText }) {
         {platformId && (
           <p className="px-1 text-[13px] text-muted">
             Detected <span className="font-semibold text-fg">{PLATFORMS[platformId].name}</span>
-            {statuses?.[platformId] && !statuses[platformId].available && ' — downloads aren’t available for this platform'}
           </p>
         )}
       </section>
@@ -158,7 +157,7 @@ export default function Home({ go, sharedText }) {
       )}
 
       {state.phase === 'error' && (
-        <ErrorNotice error={state.error} onRetry={() => analyze()} go={go} />
+        <ErrorNotice error={state.error} onRetry={() => analyze()} />
       )}
 
       {state.phase === 'result' && (
@@ -170,9 +169,9 @@ export default function Home({ go, sharedText }) {
           <section aria-labelledby="where-h">
             <h2 id="where-h" className="mb-3 text-[15px] font-bold">Where it works</h2>
             <ul className="divide-y divide-line/60 overflow-hidden rounded-[22px] bg-charcoal">
-              {['direct', 'instagram', 'facebook', 'youtube', 'tiktok', 'douyin'].map((id) => {
+              {['tiktok', 'douyin', 'instagram', 'facebook', 'youtube', 'direct'].map((id) => {
                 const s = statuses?.[id]
-                const ok = s ? s.available : id === 'direct'
+                const ok = s ? s.available : true
                 return (
                   <li key={id} className="flex items-center gap-3 px-4 py-3">
                     <PlatformMark id={id} size={34} dim={!ok} />
@@ -205,44 +204,16 @@ export default function Home({ go, sharedText }) {
 }
 
 const STATUS_COPY = {
+  tiktok: () => 'Videos, photo posts and sounds',
+  douyin: () => 'Videos and photo posts',
+  instagram: () => 'Public reels, videos and carousels',
+  facebook: () => 'Public videos and reels',
+  youtube: () => 'Videos and Shorts up to 1080p, or MP3',
   direct: () => 'Links ending in .mp4, .mp3, .jpg and similar',
-  instagram: (s) => (s?.available ? 'Your own Business/Creator posts, after connecting Meta' : 'Needs Meta login set up on the server'),
-  facebook: (s) => (s?.available ? 'Videos and photos from Pages you manage' : 'Needs Meta login set up on the server'),
-  youtube: () => 'Preview only — no official download API',
-  tiktok: () => 'Preview only — no official download API',
-  douyin: () => 'Detected only — no official download API',
 }
 
-function ErrorNotice({ error, onRetry, go }) {
-  if (error.code === 'platform_unsupported') {
-    const p = error.platform
-    const pv = error.preview
-    return (
-      <div className="sheet-in overflow-hidden rounded-[22px] bg-charcoal">
-        {pv?.thumbnail && (
-          <img src={pv.thumbnail} alt="" referrerPolicy="no-referrer" className="aspect-video w-full object-cover opacity-60" />
-        )}
-        <div className="space-y-2 p-4">
-          {pv?.title && <p className="line-clamp-2 font-bold">{pv.title}</p>}
-          <div className="flex items-start gap-3">
-            <PlatformMark id={p?.id} size={32} />
-            <div>
-              <p className="font-semibold">{p?.name} downloads aren&rsquo;t available</p>
-              <p className="mt-1 text-sm leading-relaxed text-muted">{error.message}</p>
-            </div>
-          </div>
-        </div>
-      </div>
-    )
-  }
-  if (error.code === 'login_required' || error.code === 'session_invalid') {
-    return (
-      <Notice tone="info" title="Connect your Meta account" action={{ label: 'Open Settings', onClick: () => go('settings') }}>
-        {error.message}
-      </Notice>
-    )
-  }
-  const retryable = ['network', 'timeout', 'offline', 'unreachable', 'rate_limited', 'meta_rate_limited', 'http_502', 'http_503'].includes(error.code)
+function ErrorNotice({ error, onRetry }) {
+  const retryable = ['network', 'timeout', 'offline', 'unreachable', 'rate_limited', 'http_502', 'http_503', 'blocked_by_platform', 'login_required_platform', 'extract_failed', 'upstream_error'].includes(error.code)
   return (
     <Notice tone="bad" title={TITLES[error.code] || "Couldn't get that link"} action={retryable ? { label: 'Try again', onClick: onRetry } : null}>
       {error.message}
@@ -254,10 +225,14 @@ const TITLES = {
   invalid_url: 'Check the link',
   blocked_url: 'That link isn’t allowed',
   not_media: 'No media file at that link',
-  not_owned: 'Not from your connected accounts',
+  private: 'That post is private',
+  blocked_by_platform: 'The platform blocked the server',
+  login_required_platform: 'The platform wants a login',
+  extract_failed: 'Couldn\u2019t read that post',
+  geo_blocked: 'Not available in the server\u2019s region',
+  drm: 'Copy-protected video',
   forbidden: 'That file is private',
   not_found: 'Nothing found',
-  platform_unavailable: 'Not set up yet',
   rate_limited: 'Slow down a little',
   offline: 'You’re offline',
 }

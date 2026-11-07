@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
-import { ExternalLink, LogOut, Server, Smartphone } from 'lucide-react'
-import PlatformMark from '../components/PlatformMark'
-import { API_BASE, api, getMetaSession, setMetaSession } from '../lib/api'
+import { ExternalLink, Server, Smartphone } from 'lucide-react'
+import { API_BASE, api } from '../lib/api'
 import { useApp } from '../lib/AppContext'
 import { isIOS, isStandalone } from '../lib/platforms'
 
@@ -27,43 +26,13 @@ function Group({ title, children }) {
   )
 }
 
-export default function Settings({ params }) {
-  const { prefs, setPrefs, notify } = useApp()
+export default function Settings() {
+  const { prefs, setPrefs } = useApp()
   const [health, setHealth] = useState({ state: 'checking' })
-  const [meta, setMeta] = useState({ state: getMetaSession() ? 'loading' : 'out' })
-
-  // Return from Meta login: #/settings?meta_session=... or ?meta_error=...
-  useEffect(() => {
-    const s = params.get('meta_session')
-    const err = params.get('meta_error')
-    if (s || err) {
-      if (s) { setMetaSession(s); notify('Meta account connected.', 'ok') }
-      if (err) notify(err, 'bad')
-      window.history.replaceState(null, '', window.location.pathname + '#/settings')
-      loadMeta()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params])
 
   useEffect(() => {
     api.health().then((d) => setHealth({ state: 'ok', ...d })).catch((e) => setHealth({ state: 'down', message: e.message }))
-    if (getMetaSession()) loadMeta()
   }, [])
-
-  function loadMeta() {
-    if (!getMetaSession()) return setMeta({ state: 'out' })
-    setMeta({ state: 'loading' })
-    api.metaMe().then((d) => setMeta({ state: 'in', ...d })).catch((e) => setMeta({ state: 'out', error: e.message }))
-  }
-
-  async function logout() {
-    try { await api.metaLogout() } catch { /* forget locally anyway */ }
-    setMetaSession(null)
-    setMeta({ state: 'out' })
-    notify('Meta account disconnected.')
-  }
-
-  const metaReady = health.state === 'ok' && health.meta_login
 
   return (
     <div className="space-y-7 pt-3">
@@ -86,42 +55,6 @@ export default function Settings({ params }) {
         <Toggle label="Keep download history" hint="Stored only on this device." checked={prefs.keepHistory} onChange={(v) => setPrefs({ keepHistory: v })} />
       </Group>
 
-      <Group title="Instagram and Facebook">
-        <div className="space-y-3 px-4 py-4">
-          <div className="flex -space-x-1.5">
-            <PlatformMark id="instagram" size={32} /><PlatformMark id="facebook" size={32} />
-          </div>
-          {meta.state === 'in' ? (
-            <>
-              <p className="text-[15px] font-semibold">Connected as {meta.name}</p>
-              {meta.pages?.length ? (
-                <ul className="space-y-1 text-[13px] text-muted">
-                  {meta.pages.map((p) => <li key={p.id}>{p.name}{p.instagram ? `, Instagram @${p.instagram}` : ', no Instagram linked'}</li>)}
-                </ul>
-              ) : <p className="text-[13px] text-muted">No Facebook Pages found on this account, so there&rsquo;s nothing to download yet.</p>}
-              <button onClick={logout} className="btn-ghost focus-ring bg-white/5 text-sm"><LogOut size={16} /> Disconnect</button>
-            </>
-          ) : meta.state === 'loading' ? (
-            <p className="text-sm text-muted">Checking your Meta connection…</p>
-          ) : (
-            <>
-              <p className="text-sm leading-relaxed text-muted">
-                Connect Meta to download posts from Instagram Business/Creator accounts and Facebook Pages you manage.
-                Other people&rsquo;s posts can&rsquo;t be downloaded.
-              </p>
-              {meta.error && <p className="text-sm text-bad">{meta.error}</p>}
-              {metaReady ? (
-                <a href={api.metaLoginUrl()} className="btn-primary focus-ring w-full">Connect with Facebook</a>
-              ) : (
-                <p className="rounded-xl bg-graphite/70 px-3 py-2.5 text-[13px] text-muted">
-                  {health.state === 'checking' ? 'Checking server…' : 'Meta login isn’t set up on the server yet.'}
-                </p>
-              )}
-            </>
-          )}
-        </div>
-      </Group>
-
       <Group title="App">
         <div className="flex items-center gap-3 px-4 py-3.5">
           <Server size={19} className="text-muted" />
@@ -137,6 +70,7 @@ export default function Settings({ params }) {
           <p className="px-4 py-3 text-[12.5px] leading-relaxed text-muted">
             Files up to {health.limits.max_download_mb} MB; MP3 conversion up to {health.limits.max_convert_mb} MB.
             The free server sleeps after 15 idle minutes, so the first request can take about a minute.
+            {health.engine && ` Engine: ${health.engine}.`}
           </p>
         )}
         {!isStandalone() && (
@@ -156,8 +90,8 @@ export default function Settings({ params }) {
       </Group>
 
       <p className="px-1 pb-2 text-[12.5px] leading-relaxed text-muted">
-        Only download media you own or have permission to save. Fetchly uses official platform APIs and never gets
-        around privacy settings, logins or copy protection.
+        Fetchly reads public posts. Private posts and copy-protected videos can&rsquo;t be downloaded.
+        Only save and reuse media you have the right to.
       </p>
     </div>
   )

@@ -62,7 +62,7 @@ export function AppProvider({ children }) {
   const run = useCallback(async (job) => {
     const ctrl = new AbortController()
     controllers.current.set(job.id, ctrl)
-    patchJob(job.id, { status: 'downloading', loaded: 0, total: job.sizeHint || 0, error: null })
+    patchJob(job.id, { status: 'downloading', loaded: 0, total: 0, error: null })
     try {
       let blob, filename = job.filename
       if (job.kind === 'zip') {
@@ -79,7 +79,7 @@ export function AppProvider({ children }) {
         blob = await zip.generateAsync({ type: 'blob', compression: 'STORE' })
       } else {
         blob = await fetchBlob(job.parts[0].ticket, ctrl.signal, (loaded, total) =>
-          patchJob(job.id, { loaded, total: total || job.sizeHint || 0 }))
+          patchJob(job.id, { loaded, total }))
         patchJob(job.id, { status: 'saving' })
       }
       const how = await saveBlob(blob, filename, { preferShare: prefs.iosShareSheet })

@@ -9,7 +9,6 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from config import Config
 from extensions import limiter
 from routes.api import api_bp
-from routes.auth import auth_bp
 from services.errors import ApiError
 
 
@@ -31,7 +30,6 @@ def create_app():
     limiter.init_app(app)
 
     app.register_blueprint(api_bp, url_prefix="/api")
-    app.register_blueprint(auth_bp, url_prefix="/auth")
 
     @app.get("/")
     def root():

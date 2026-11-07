@@ -52,7 +52,7 @@ export default function App() {
           {route.tab === 'home' && <Home go={go} sharedText={sharedText} />}
           {route.tab === 'downloads' && <Downloads go={go} />}
           {route.tab === 'history' && <History go={go} />}
-          {route.tab === 'settings' && <Settings params={route.params} />}
+          {route.tab === 'settings' && <Settings />}
         </main>
 
         <nav

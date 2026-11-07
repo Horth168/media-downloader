@@ -32,7 +32,7 @@ export default function MediaPreview({ data, format, sourceUrl, go }) {
       {isGallery
         ? <Gallery media={media} platform={platform} sourceUrl={sourceUrl} go={go} />
         : <SingleItem item={media.items[0]} media={media} platform={platform} format={format} sourceUrl={sourceUrl} go={go} />}
-      {format === 'photo' && photos.length === 0 && (
+      {format === 'photo' && photos.length === 0 && media.items[0]?.type !== 'image' && (
         <p className="px-4 pb-4 text-[13px] text-muted">This link has no photos — pick a video or audio format above.</p>
       )}
     </article>
@@ -43,7 +43,7 @@ function SingleItem({ item, media, platform, format, sourceUrl, go }) {
   const { startDownload } = useApp()
   const initial = useMemo(() => {
     const want = format === 'photo' ? 'photo' : format
-    return (item.formats.find((f) => f.id === want) || item.formats[0])?.id
+    return (item.formats.find((f) => f.id === want || f.id.startsWith(want + '-')) || item.formats[0])?.id
   }, [item, format])
   const [chosen, setChosen] = useState(initial)
   const f = item.formats.find((x) => x.id === chosen) || item.formats[0]
@@ -76,7 +76,7 @@ function SingleItem({ item, media, platform, format, sourceUrl, go }) {
                     <span className="block text-[12.5px] text-muted">{x.quality}</span>
                   </span>
                   <span className="text-[13px] font-semibold tabular-nums text-muted">
-                    {formatBytes(x.size) || (x.id === 'mp3' && x.quality !== 'Original' ? 'Converted on download' : 'Size unknown')}
+                    {formatBytes(x.size) ? `~${formatBytes(x.size)}` : ''}
                   </span>
                 </label>
               </li>
@@ -85,7 +85,7 @@ function SingleItem({ item, media, platform, format, sourceUrl, go }) {
         </ul>
       </fieldset>
       <button onClick={download} className="btn-primary focus-ring w-full">
-        <Download size={19} strokeWidth={2.4} /> Download {f.label.split(' ')[0]}
+        <Download size={19} strokeWidth={2.4} /> Download {f.label.split(' ')[0]}{/^\d/.test(f.quality) ? ` ${f.quality}` : ''}
       </button>
     </div>
   )

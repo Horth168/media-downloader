@@ -11,15 +11,13 @@ from services.tokens import read_ticket
 api_bp = Blueprint("api", __name__)
 
 
-def _session_from_request():
-    auth = request.headers.get("Authorization", "")
-    return auth[7:].strip() if auth.lower().startswith("bearer ") else None
-
 
 @api_bp.get("/health")
 @limiter.exempt
 def health():
-    return jsonify(ok=True, status="healthy", meta_login=Config.meta_enabled(),
+    import yt_dlp.version
+    return jsonify(ok=True, status="healthy", engine=f"yt-dlp {yt_dlp.version.__version__}",
+                   cookies=bool(Config.YTDLP_COOKIES),
                    limits={"max_download_mb": Config.MAX_DOWNLOAD_MB,
                            "max_convert_mb": Config.MAX_CONVERT_MB})
 
@@ -50,7 +48,7 @@ def analyze():
     platform = detect(url)
     platform.validate(url)          # cheap, platform-specific format checks first
     validate_public_url(url)        # scheme, host, port and SSRF checks
-    media = platform.analyze(url, session=_session_from_request())
+    media = platform.analyze(url)
     return jsonify(ok=True, platform=platform.describe(), media=media)
 
 
@@ -58,7 +56,9 @@ def analyze():
 @limiter.limit(Config.RATE_LIMIT_DOWNLOAD)
 def download():
     ticket = read_ticket(request.args.get("t", ""))
-    url, mode, filename = ticket["u"], ticket["m"], ticket["n"]
+    if "y" in ticket:  # platform media fetched with yt-dlp
+        return downloader.stream_platform(ticket)
+    url, mode, filename, headers = ticket["u"], ticket["m"], ticket["n"], ticket.get("h")
     if mode == "mp3":
-        return downloader.stream_mp3(url, filename)
-    return downloader.stream_original(url, filename)
+        return downloader.stream_mp3(url, filename, headers)
+    return downloader.stream_original(url, filename, headers)

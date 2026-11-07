@@ -1,0 +1,436 @@
+"""TikTok, Douyin, YouTube, Instagram and Facebook via yt-dlp + small page readers.
+
+yt-dlp reads the platforms' public web pages. Platforms change often and block
+datacenter servers, so failures are expected from time to time — errors are
+translated into plain messages, and yt-dlp is upgraded on every deploy.
+
+Only the named platform extractors are enabled (no generic extractor), so yt-dlp
+can't be pointed at arbitrary or internal URLs.
+"""
+import json
+import logging
+import os
+import re
+import shutil
+import tempfile
+from urllib.parse import urlsplit
+
+import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError
+
+from config import Config
+from services.errors import ApiError
+from services.netguard import safe_request
+from services.platforms.base import Platform, build_item, safe_filename
+from services.tokens import make_ticket
+
+log = logging.getLogger(__name__)
+
+MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+             "(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1")
+DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+QUALITIES = (1080, 720, 480, 360)
+MAX_ITEMS = 20
+
+_ffmpeg_dir = None
+_cookie_file = None
+
+
+def ffmpeg_dir():
+    """yt-dlp wants a folder containing a binary called `ffmpeg`."""
+    global _ffmpeg_dir
+    if _ffmpeg_dir:
+        return _ffmpeg_dir
+    exe = shutil.which("ffmpeg")
+    if exe:
+        _ffmpeg_dir = os.path.dirname(exe)
+        return _ffmpeg_dir
+    import imageio_ffmpeg
+    folder = os.path.join(tempfile.gettempdir(), "fetchly-ffbin")
+    os.makedirs(folder, exist_ok=True)
+    link = os.path.join(folder, "ffmpeg")
+    if not os.path.exists(link):
+        os.symlink(imageio_ffmpeg.get_ffmpeg_exe(), link)
+    _ffmpeg_dir = folder
+    return folder
+
+
+def cookie_file():
+    """Optional cookies (Netscape cookies.txt text) from the YTDLP_COOKIES env var."""
+    global _cookie_file
+    if not Config.YTDLP_COOKIES:
+        return None
+    if _cookie_file and os.path.exists(_cookie_file):
+        return _cookie_file
+    fd, path = tempfile.mkstemp(prefix="fetchly-cookies-", suffix=".txt")
+    with os.fdopen(fd, "w") as f:
+        f.write(Config.YTDLP_COOKIES.replace("\\n", "\n"))
+    _cookie_file = path
+    return path
+
+
+def ydl_opts(extractors, **extra):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "retries": 2,
+        "allowed_extractors": list(extractors),
+        "js_runtimes": {"deno": {}, "node": {}},
+        "http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+    }
+    cf = cookie_file()
+    if cf:
+        opts["cookiefile"] = cf
+    opts.update(extra)
+    return opts
+
+
+def friendly_error(platform_name, err):
+    msg = str(err)
+    low = msg.lower()
+    log.warning("yt-dlp error (%s): %s", platform_name, msg[:400])
+    if "not a bot" in low or "sign in to confirm" in low:
+        return ApiError("blocked_by_platform",
+                        f"{platform_name} is blocking our server right now (it asked for a sign-in to prove we're "
+                        "not a bot). Try again later, or add cookies on the server — see the README.", 503)
+    if "private" in low:
+        return ApiError("private", "That post is private, so it can't be downloaded.", 403)
+    if any(k in low for k in ("login", "log in", "cookies", "rate-limit", "rate limit", "authentication")):
+        return ApiError("login_required_platform",
+                        f"{platform_name} wants a login before showing this post to our server. Try again later, "
+                        "or add cookies on the server — see the README.", 403)
+    if "unsupported url" in low:
+        return ApiError("invalid_url", f"That doesn't look like a {platform_name} post link.", 400)
+    if any(k in low for k in ("unavailable", "removed", "not found", "404", "does not exist")):
+        return ApiError("not_found", "That post was removed or isn't available.", 404)
+    if "geo" in low or "country" in low:
+        return ApiError("geo_blocked", "That post isn't available in the server's region.", 451)
+    if "requested format" in low:
+        return ApiError("format_unavailable", "That quality isn't available for this post. Pick another.", 422)
+    if "drm" in low:
+        return ApiError("drm", "That video is copy-protected (DRM) and can't be downloaded.", 422)
+    return ApiError("extract_failed", f"Couldn't read that {platform_name} post. Try again in a moment.", 502)
+
+
+def _height_selector(h):
+    return (f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/"
+            f"bv*[height<={h}]+ba/b[height<={h}]/b")
+
+
+def _estimate_size(formats, h):
+    vids = [f for f in formats if f.get("vcodec") not in (None, "none") and (f.get("height") or 0) <= h]
+    if not vids:
+        return None
+    best = max(vids, key=lambda f: ((f.get("height") or 0), f.get("tbr") or 0))
+    size = best.get("filesize") or best.get("filesize_approx")
+    if size and best.get("acodec") in (None, "none"):
+        auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+        if auds:
+            a = max(auds, key=lambda f: f.get("tbr") or 0)
+            size += a.get("filesize") or a.get("filesize_approx") or 0
+    return int(size) if size else None
+
+
+def _audio_size(formats):
+    auds = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    if not auds:
+        return None
+    a = max(auds, key=lambda f: f.get("tbr") or 0)
+    s = a.get("filesize") or a.get("filesize_approx")
+    return int(s) if s else None
+
+
+class YtdlpPlatform(Platform):
+    extractors = ()
+    page_headers = {}
+
+    def status(self):
+        return {"available": True, "requires_login": False,
+                "reason": "Public posts. The platform may block some requests."}
+
+    def validate(self, url):
+        pass
+
+    # --- helpers -----------------------------------------------------------
+    def resolve(self, url):
+        """Follow short-link redirects (vm.tiktok.com, v.douyin.com, fb share links)."""
+        try:
+            r = safe_request(url, headers={"User-Agent": MOBILE_UA})
+            final = r.url
+            r.close()
+            return final
+        except ApiError:
+            return url
+
+    def extract(self, url):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts(self.extractors, skip_download=True)) as ydl:
+                return ydl.sanitize_info(ydl.extract_info(url, download=False))
+        except (DownloadError, ExtractorError) as e:
+            raise friendly_error(self.name, e)
+
+    def media_from_info(self, info, page_url):
+        entries = info.get("entries")
+        nodes = list(entries)[:MAX_ITEMS] if entries else [info]
+        nodes = [n for n in nodes if n]
+        if not nodes:
+            raise ApiError("not_found", "Nothing downloadable was found in that post.", 404)
+        title = (info.get("title") or info.get("description") or nodes[0].get("title") or self.name)
+        title = title.splitlines()[0][:70]
+        items = []
+        for i, n in enumerate(nodes):
+            items.append(self._video_item(n, page_url, title if len(nodes) == 1 else f"{title}_{i + 1}",
+                                          index=(i + 1) if entries else None))
+        return {
+            "title": title,
+            "author": info.get("uploader") or info.get("channel") or nodes[0].get("uploader"),
+            "thumbnail": info.get("thumbnail") or nodes[0].get("thumbnail"),
+            "kind": "carousel" if len(items) > 1 else "video",
+            "items": items,
+        }
+
+    def _video_item(self, n, page_url, title, index=None):
+        formats = n.get("formats") or [n]
+        heights = sorted({f.get("height") for f in formats
+                          if f.get("height") and f.get("vcodec") not in (None, "none")}, reverse=True)
+        top = heights[0] if heights else None
+        base = safe_filename(title, None)
+        target = n.get("webpage_url") or page_url
+        out = []
+        has_video = bool(heights) or any(f.get("vcodec") not in (None, "none") for f in formats)
+        if has_video:
+            levels = [q for q in QUALITIES if top and q <= top][:3] or [None]
+            if top and top not in QUALITIES and top < 1080 and top not in levels:
+                levels = [top] + levels[:2]
+            for h in levels:
+                sel = _height_selector(h) if h else "b/bv*+ba"
+                label_q = f"{h}p" if h else "Best available"
+                out.append(self._fmt(f"mp4-{h or 'best'}", "MP4 Video", label_q, "mp4",
+                                     _estimate_size(formats, h) if h else None,
+                                     target, sel, "video", base, index))
+        out.append(self._fmt("mp3", "MP3 Audio", "Audio only", "mp3", _audio_size(formats),
+                             target, "ba/b", "mp3", base, index))
+        return {
+            "id": str(n.get("id") or index or 0),
+            "type": "video" if has_video else "audio",
+            "thumbnail": n.get("thumbnail"),
+            "width": n.get("width"),
+            "height": n.get("height"),
+            "duration": n.get("duration"),
+            "formats": out,
+        }
+
+    def _fmt(self, fid, label, quality, ext, size, url, selector, mode, base, index):
+        is_sized = fid.startswith("mp4-") and fid != "mp4-best"
+        filename = safe_filename(f"{base}_{quality}" if is_sized else base, ext)
+        return {
+            "id": fid, "label": label, "quality": quality, "ext": ext, "size": size, "filename": filename,
+            "ticket": make_ticket({"y": url, "x": self.id, "f": selector, "m": mode, "n": filename, "i": index}),
+        }
+
+    def analyze(self, url, session=None):
+        return self.media_from_info(self.extract(url), url)
+
+
+def _image_items(urls, title, headers, item_prefix="img"):
+    items = []
+    for i, u in enumerate(urls[:MAX_ITEMS]):
+        it = build_item(source_url=u, kind="image", title=f"{title}_{i + 1}" if len(urls) > 1 else title,
+                        ext="jpg", thumbnail=u, item_id=f"{item_prefix}{i}")
+        for f in it["formats"]:
+            # Re-sign with the headers the CDN expects.
+            f["ticket"] = make_ticket({"u": u, "m": "original", "n": f["filename"], "k": "image", "h": headers})
+        items.append(it)
+    return items
+
+
+def _audio_direct_item(url, title, headers):
+    base = safe_filename(title, None)
+    fn = safe_filename(base, "mp3")
+    return {
+        "id": "audio", "type": "audio", "thumbnail": None, "width": None, "height": None,
+        "formats": [{"id": "mp3", "label": "MP3 Audio", "quality": "Post soundtrack", "ext": "mp3", "size": None,
+                     "filename": fn,
+                     "ticket": make_ticket({"u": url, "m": "mp3", "n": fn, "k": "audio", "h": headers})}],
+    }
+
+
+class YouTube(YtdlpPlatform):
+    id = "youtube"
+    name = "YouTube"
+    color = "#ff0033"
+    domains = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+    extractors = ("youtube",)
+
+
+class Instagram(YtdlpPlatform):
+    id = "instagram"
+    name = "Instagram"
+    color = "#e1306c"
+    domains = ("instagram.com", "instagr.am")
+    extractors = ("instagram",)
+
+
+class Facebook(YtdlpPlatform):
+    id = "facebook"
+    name = "Facebook"
+    color = "#1877f2"
+    domains = ("facebook.com", "fb.com", "fb.watch")
+    extractors = ("facebook", "facebook:reel", "facebookredirecturl")
+
+    def analyze(self, url, session=None):
+        if "/share/" in urlsplit(url).path or (urlsplit(url).hostname or "").endswith("fb.watch"):
+            url = self.resolve(url)
+        return super().analyze(url)
+
+
+class TikTok(YtdlpPlatform):
+    id = "tiktok"
+    name = "TikTok"
+    color = "#25f4ee"
+    domains = ("tiktok.com",)
+    extractors = ("tiktok", "vm.tiktok")
+    cdn_headers = {"User-Agent": DESKTOP_UA, "Referer": "https://www.tiktok.com/"}
+
+    def analyze(self, url, session=None):
+        host = urlsplit(url).hostname or ""
+        if host.startswith(("vm.", "vt.")) or "/t/" in urlsplit(url).path:
+            url = self.resolve(url)
+        if "/photo/" in urlsplit(url).path:
+            return self.photo_post(url)
+        try:
+            return super().analyze(url)
+        except ApiError as first:
+            try:
+                return self.photo_post(url)
+            except ApiError:
+                raise first
+
+    def photo_post(self, url):
+        r = safe_request(url, headers={"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"})
+        html = r.text
+        r.close()
+        m = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.S)
+        if not m:
+            raise ApiError("extract_failed", "Couldn't read that TikTok post. Try again in a moment.", 502)
+        try:
+            data = json.loads(m.group(1))
+            item = data["__DEFAULT_SCOPE__"]["webapp.video-detail"]["itemInfo"]["itemStruct"]
+        except (ValueError, KeyError, TypeError):
+            raise ApiError("not_found", "That TikTok post was removed, is private, or couldn't be read.", 404)
+        images = [img["imageURL"]["urlList"][0] for img in (item.get("imagePost") or {}).get("images", [])
+                  if img.get("imageURL", {}).get("urlList")]
+        if not images:
+            raise ApiError("not_found", "That TikTok post has no photos.", 404)
+        title = (item.get("desc") or f"tiktok_{item.get('id', '')}").splitlines()[0][:70]
+        items = _image_items(images, title, self.cdn_headers)
+        music = (item.get("music") or {}).get("playUrl")
+        if music:
+            items.append(_audio_direct_item(music, title, self.cdn_headers))
+        return {"title": title, "author": (item.get("author") or {}).get("uniqueId"),
+                "thumbnail": images[0], "kind": "carousel" if len(items) > 1 else "image", "items": items}
+
+
+class Douyin(YtdlpPlatform):
+    id = "douyin"
+    name = "Douyin"
+    color = "#fe2c55"
+    domains = ("douyin.com", "iesdouyin.com")
+    extractors = ("douyin",)
+    cdn_headers = {"User-Agent": MOBILE_UA, "Referer": "https://www.douyin.com/"}
+
+    def aweme_id(self, url):
+        for pat in (r"/(?:video|note|slides|share/video|share/note|share/slides)/(\d{8,})", r"modal_id=(\d{8,})",
+                    r"aweme_id=(\d{8,})"):
+            m = re.search(pat, url)
+            if m:
+                return m.group(1)
+        return None
+
+    def analyze(self, url, session=None):
+        aid = self.aweme_id(url)
+        if not aid:
+            aid = self.aweme_id(self.resolve(url))
+        if not aid:
+            raise ApiError("invalid_url", "That doesn't look like a Douyin video or photo link.", 400)
+        try:
+            return self.share_page(aid)
+        except ApiError as first:
+            try:
+                return super().analyze(f"https://www.douyin.com/video/{aid}")
+            except ApiError:
+                raise first
+
+    def share_page(self, aid):
+        r = safe_request(f"https://www.iesdouyin.com/share/video/{aid}/", headers={"User-Agent": MOBILE_UA})
+        html = r.text
+        r.close()
+        m = re.search(r"window\._ROUTER_DATA\s*=\s*(\{.*?\})\s*</script>", html, re.S)
+        if not m:
+            raise ApiError("extract_failed", "Couldn't read that Douyin post. Try again in a moment.", 502)
+        try:
+            loader = json.loads(m.group(1))["loaderData"]
+            res = next(v["videoInfoRes"] for v in loader.values() if isinstance(v, dict) and v.get("videoInfoRes"))
+            item = res["item_list"][0]
+        except (ValueError, KeyError, StopIteration, IndexError, TypeError):
+            raise ApiError("not_found", "That Douyin post was removed, is private, or couldn't be read.", 404)
+
+        title = (item.get("desc") or f"douyin_{aid}").splitlines()[0][:70]
+        author = (item.get("author") or {}).get("nickname")
+        images = [img["url_list"][0] for img in (item.get("images") or []) if img.get("url_list")]
+        if images:
+            items = _image_items(images, title, self.cdn_headers)
+            music = ((item.get("music") or {}).get("play_url") or {}).get("url_list") or []
+            if music:
+                items.append(_audio_direct_item(music[0], title, self.cdn_headers))
+            return {"title": title, "author": author, "thumbnail": images[0],
+                    "kind": "carousel" if len(items) > 1 else "image", "items": items}
+
+        video = item.get("video") or {}
+        urls = (video.get("play_addr") or {}).get("url_list") or []
+        if not urls:
+            raise ApiError("format_unavailable", "Douyin didn't provide a video file for this post.", 422)
+        play = urls[0].replace("playwm", "play")  # no-watermark variant
+        cover = ((video.get("cover") or {}).get("url_list") or [None])[0]
+        it = build_item(source_url=play, kind="video", title=title, ext="mp4", thumbnail=cover, item_id=aid)
+        for f in it["formats"]:
+            f["ticket"] = make_ticket({"u": play, "m": "original" if f["id"] == "mp4" else "mp3",
+                                       "n": f["filename"], "k": "video", "h": self.cdn_headers})
+        return {"title": title, "author": author, "thumbnail": cover, "kind": "video", "items": [it]}
+
+
+# --- downloading ---------------------------------------------------------------
+EXTRACTORS = {cls.id: cls.extractors for cls in (YouTube, Instagram, Facebook, TikTok, Douyin)}
+NAMES = {cls.id: cls.name for cls in (YouTube, Instagram, Facebook, TikTok, Douyin)}
+
+
+def download_to(workdir, ticket):
+    """Download one item with yt-dlp into workdir. Returns the file path."""
+    pid = ticket["x"]
+    opts = ydl_opts(
+        EXTRACTORS[pid],
+        outtmpl=os.path.join(workdir, "media.%(ext)s"),
+        format=ticket["f"],
+        merge_output_format="mp4",
+        ffmpeg_location=ffmpeg_dir(),
+        max_filesize=Config.MAX_DOWNLOAD_MB * 1024 * 1024,
+        overwrites=True,
+    )
+    if ticket.get("i"):
+        opts["noplaylist"] = False
+        opts["playlist_items"] = str(ticket["i"])
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([ticket["y"]])
+    except (DownloadError, ExtractorError) as e:
+        raise friendly_error(NAMES[pid], e)
+    files = [os.path.join(workdir, f) for f in os.listdir(workdir)
+             if not f.endswith((".part", ".ytdl", ".temp")) and os.path.isfile(os.path.join(workdir, f))]
+    if not files:
+        raise ApiError("too_large", f"That file is over the {Config.MAX_DOWNLOAD_MB} MB limit, "
+                                    "or the platform didn't send it. Try a lower quality.", 413)
+    return max(files, key=os.path.getsize)
