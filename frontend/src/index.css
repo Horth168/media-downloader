@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ring: #7C5CFF;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body, #root { height: 100%; }
+body {
+  @apply bg-ink text-fg font-sans antialiased;
+  font-feature-settings: 'ss01', 'cv11';
+  overscroll-behavior-y: none;
+}
+
+/* Quiet background: a single soft violet→blue haze at the top of the screen. */
+.haze {
+  background:
+    radial-gradient(120% 60% at 15% -10%, rgba(124, 92, 255, 0.22), transparent 60%),
+    radial-gradient(90% 50% at 100% 0%, rgba(59, 130, 246, 0.14), transparent 60%),
+    #06060A;
+}
+
+.gradient-text {
+  background: linear-gradient(120deg, #A995FF, #7C5CFF 40%, #3B82F6);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-2xl px-5 font-bold text-white transition active:scale-[0.98] disabled:opacity-50 disabled:active:scale-100;
+  background: linear-gradient(120deg, #7C5CFF, #3B82F6);
+  min-height: 52px;
+}
+.btn-ghost {
+  @apply inline-flex items-center justify-center gap-2 rounded-xl px-3 font-semibold text-fg/90 transition active:scale-[0.97] hover:bg-white/5 disabled:opacity-40;
+  min-height: 40px;
+}
+.focus-ring { @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet/80 focus-visible:ring-offset-2 focus-visible:ring-offset-ink; }
+
+/* The link box ring: glows in the detected platform's color. */
+.linkbox {
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ring) 55%, transparent),
+              0 0 28px -6px color-mix(in srgb, var(--ring) 70%, transparent);
+  transition: box-shadow 450ms ease;
+}
+.linkbox:focus-within {
+  box-shadow: 0 0 0 2px var(--ring),
+              0 0 44px -4px color-mix(in srgb, var(--ring) 85%, transparent);
+}
+
+.safe-top { padding-top: max(env(safe-area-inset-top), 12px); }
+.safe-bottom { padding-bottom: max(env(safe-area-inset-bottom), 8px); }
+
+.spinner {
+  width: 22px; height: 22px; border-radius: 9999px;
+  border: 2.5px solid rgba(255,255,255,0.18); border-top-color: #fff;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.shimmer {
+  background: linear-gradient(90deg, #1C1C26 0%, #262634 50%, #1C1C26 100%);
+  background-size: 200% 100%;
+  animation: shimmer 1.3s ease-in-out infinite;
+}
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+
+.sheet-in { animation: sheetIn 320ms cubic-bezier(.2,.8,.2,1); }
+@keyframes sheetIn { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
