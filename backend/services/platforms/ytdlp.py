@@ -558,7 +558,13 @@ class Douyin(YtdlpPlatform):
             raise ApiError("extract_failed", "Couldn't read that Douyin post. Try again in a moment.", 502)
         try:
             loader = json.loads(m.group(1))["loaderData"]
-            res = next(v["videoInfoRes"] for v in loader.values() if isinstance(v, dict) and v.get("videoInfoRes"))
+            shape = {k: (list(v)[:8] if isinstance(v, dict) else type(v).__name__) for k, v in loader.items()}
+            res = next((v["videoInfoRes"] for v in loader.values() if isinstance(v, dict) and v.get("videoInfoRes")),
+                       None)
+            if res is None or not res.get("item_list"):
+                log.warning("Douyin share page %s: loaderData=%s videoInfoRes=%s", aid, json.dumps(shape)[:600],
+                            json.dumps(res)[:300] if res else None)
+                raise StopIteration
             item = res["item_list"][0]
         except (ValueError, KeyError, StopIteration, IndexError, TypeError) as e:
             log.warning("Douyin share page %s: unexpected data (%s: %s)", aid, type(e).__name__, str(e)[:120])
