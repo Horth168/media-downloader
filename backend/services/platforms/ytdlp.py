@@ -578,11 +578,37 @@ def download_to(workdir, ticket):
     if ticket.get("i"):
         opts["noplaylist"] = False
         opts["playlist_items"] = str(ticket["i"])
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([ticket["y"]])
-    except (DownloadError, ExtractorError) as e:
-        raise friendly_error(NAMES[pid], e)
+    attempts = [opts]
+    if pid == "youtube":
+        # The bot check can hit any client at any time — try the others before giving up.
+        tried = ticket.get("c")
+        for clients in [None, *YouTube.fallback_clients]:
+            if clients == tried:
+                continue
+            alt = dict(opts)
+            if clients:
+                alt["extractor_args"] = {"youtube": {"player_client": clients}}
+            else:
+                alt.pop("extractor_args", None)
+            attempts.append(alt)
+    err = None
+    for attempt in attempts:
+        try:
+            with yt_dlp.YoutubeDL(attempt) as ydl:
+                ydl.download([ticket["y"]])
+            err = None
+            break
+        except (DownloadError, ExtractorError) as e:
+            err = e
+            low = str(e).lower()
+            if pid != "youtube" or not ("not a bot" in low or "sign in" in low or "format" in low):
+                break
+            log.info("YouTube download attempt failed (%s): %s",
+                     (attempt.get("extractor_args") or {}).get("youtube"), str(e)[:120])
+            for f in os.listdir(workdir):
+                os.remove(os.path.join(workdir, f))
+    if err:
+        raise friendly_error(NAMES[pid], err)
     files = [os.path.join(workdir, f) for f in os.listdir(workdir)
              if not f.endswith((".part", ".ytdl", ".temp")) and os.path.isfile(os.path.join(workdir, f))]
     if not files:
