@@ -265,6 +265,38 @@ class YouTube(YtdlpPlatform):
     color = "#ff0033"
     domains = ("youtube.com", "youtu.be", "youtube-nocookie.com")
     extractors = ("youtube",)
+    # Other YouTube clients sometimes slip past the bot check when the default one is blocked.
+    fallback_clients = (["tv", "web_safari"], ["mweb"], ["android_vr"])
+
+    def extract(self, url):
+        try:
+            return super().extract(url)
+        except ApiError as first:
+            if first.code != "blocked_by_platform":
+                raise
+            for clients in self.fallback_clients:
+                try:
+                    opts = ydl_opts(self.extractors, skip_download=True,
+                                    extractor_args={"youtube": {"player_client": clients}})
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        info = ydl.sanitize_info(ydl.extract_info(url, download=False))
+                    info["_clients"] = clients
+                    return info
+                except (DownloadError, ExtractorError) as e:
+                    log.info("YouTube client %s failed: %s", clients, str(e)[:160])
+            raise first
+
+    def media_from_info(self, info, page_url):
+        media = super().media_from_info(info, page_url)
+        clients = info.get("_clients")
+        if clients:  # remember which client worked, so the download uses it too
+            from services.tokens import read_ticket
+            for it in media["items"]:
+                for f in it["formats"]:
+                    t = read_ticket(f["ticket"])
+                    t["c"] = clients
+                    f["ticket"] = make_ticket(t)
+        return media
 
 
 class Instagram(YtdlpPlatform):
@@ -275,16 +307,57 @@ class Instagram(YtdlpPlatform):
     extractors = ("instagram",)
 
 
+def _browser_get(extractor_key, url, video_id="page"):
+    """Fetch a page through yt-dlp's networking (browser impersonation + cookie handling)."""
+    with yt_dlp.YoutubeDL(ydl_opts((extractor_key.lower(),))) as ydl:
+        ie = ydl.get_info_extractor(extractor_key)
+        try:
+            webpage, urlh = ie._download_webpage_handle(
+                url, video_id, note=False, impersonate=True, headers={"Accept-Language": "en-US,en;q=0.9"})
+        except (DownloadError, ExtractorError) as e:
+            raise ApiError("extract_failed", f"Couldn't open that link ({str(e)[:80]}).", 502)
+        return webpage, urlh.url
+
+
 class Facebook(YtdlpPlatform):
     id = "facebook"
     name = "Facebook"
     color = "#1877f2"
     domains = ("facebook.com", "fb.com", "fb.watch")
     extractors = ("facebook", "facebook:reel", "facebookredirecturl")
+    VIDEO_PATH = re.compile(r"/(?:reel|videos|watch|[\w.]+/videos)/|[?&]v=\d|story_fbid=")
+
+    def resolve_share(self, url):
+        """Turn /share/v/..., /share/r/... and fb.watch links into the real video link."""
+        webpage, final = _browser_get("Facebook", url)
+        parsed = urlsplit(final)
+        if "login" in parsed.path:
+            from urllib.parse import parse_qs, unquote
+            nxt = parse_qs(parsed.query).get("next", [None])[0]
+            if nxt:
+                final = unquote(nxt)
+        if self.VIDEO_PATH.search(final):
+            return final
+        for pat in (r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"',
+                    r'<link[^>]+rel="canonical"[^>]+href="([^"]+)"',
+                    r'"(https:\\/\\/www\.facebook\.com\\/(?:reel|watch|[^"]+?\\/videos)\\/[^"]+)"'):
+            m = re.search(pat, webpage)
+            if m:
+                cand = m.group(1).replace("\\/", "/").replace("&amp;", "&")
+                if self.VIDEO_PATH.search(cand):
+                    return cand
+        m = re.search(r'"video_id":"(\d{6,})"', webpage) or re.search(r"/reel/(\d{6,})", webpage)
+        if m:
+            return f"https://www.facebook.com/reel/{m.group(1)}"
+        log.warning("Facebook share link didn't resolve: %s -> %s", url, final)
+        raise ApiError("login_required_platform",
+                       "Facebook wouldn't show this shared link to our server. Open it in Facebook, tap Share → "
+                       "Copy link on the video itself (a /reel/ or /videos/ link), and paste that.", 403)
 
     def analyze(self, url, session=None):
-        if "/share/" in urlsplit(url).path or (urlsplit(url).hostname or "").endswith("fb.watch"):
-            url = self.resolve(url)
+        p = urlsplit(url)
+        if "/share/" in p.path or (p.hostname or "").endswith("fb.watch"):
+            url = self.resolve_share(url)
         return super().analyze(url)
 
 
@@ -296,37 +369,55 @@ class TikTok(YtdlpPlatform):
     extractors = ("tiktok", "vm.tiktok")
     cdn_headers = {"User-Agent": DESKTOP_UA, "Referer": "https://www.tiktok.com/"}
 
+    def resolve_short(self, url):
+        try:
+            _, final = _browser_get("TikTok", url, "short")
+            return final
+        except ApiError:
+            return self.resolve(url)
+
     def analyze(self, url, session=None):
-        host = urlsplit(url).hostname or ""
-        if host.startswith(("vm.", "vt.")) or "/t/" in urlsplit(url).path:
-            url = self.resolve(url)
+        p = urlsplit(url)
+        if (p.hostname or "").startswith(("vm.", "vt.")) or p.path.startswith("/t/"):
+            url = self.resolve_short(url)
         if "/photo/" in urlsplit(url).path:
             return self.photo_post(url)
-        try:
-            return super().analyze(url)
-        except ApiError as first:
+        media = super().analyze(url)
+        if all(it["type"] == "audio" for it in media["items"]):
+            # Slideshow posts come back from yt-dlp as audio only — fetch the photos too.
             try:
                 return self.photo_post(url)
             except ApiError:
-                raise first
+                pass
+        return media
 
     def photo_post(self, url):
-        r = safe_request(url, headers={"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"})
-        html = r.text
-        r.close()
-        m = re.search(r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', html, re.S)
+        m = re.search(r"/(?:photo|video)/(\d+)", url)
         if not m:
-            raise ApiError("extract_failed", "Couldn't read that TikTok post. Try again in a moment.", 502)
-        try:
-            data = json.loads(m.group(1))
-            item = data["__DEFAULT_SCOPE__"]["webapp.video-detail"]["itemInfo"]["itemStruct"]
-        except (ValueError, KeyError, TypeError):
+            raise ApiError("invalid_url", "That doesn't look like a TikTok post link.", 400)
+        post_id = m.group(1)
+        with yt_dlp.YoutubeDL(ydl_opts(self.extractors)) as ydl:
+            ie = ydl.get_info_extractor("TikTok")
+            try:
+                item, status = ie._extract_web_data_and_status(url, post_id)
+            except (DownloadError, ExtractorError) as e:
+                raise friendly_error(self.name, e)
+        if status in (10216, 10222):
+            raise ApiError("private", "That TikTok post is private, so it can't be downloaded.", 403)
+        if status == 10204:
+            raise ApiError("blocked_by_platform", "TikTok is blocking our server for this post. Try again later.", 503)
+        if not item:
+            log.warning("TikTok photo post %s: no data (status %s)", post_id, status)
             raise ApiError("not_found", "That TikTok post was removed, is private, or couldn't be read.", 404)
-        images = [img["imageURL"]["urlList"][0] for img in (item.get("imagePost") or {}).get("images", [])
-                  if img.get("imageURL", {}).get("urlList")]
+
+        def best_url(img):
+            urls = (img.get("imageURL") or {}).get("urlList") or []
+            return next((u for u in urls if "jpeg" in u or ".jpg" in u), urls[0] if urls else None)
+
+        images = [u for u in (best_url(i) for i in (item.get("imagePost") or {}).get("images", [])) if u]
         if not images:
             raise ApiError("not_found", "That TikTok post has no photos.", 404)
-        title = (item.get("desc") or f"tiktok_{item.get('id', '')}").splitlines()[0][:70]
+        title = (item.get("desc") or f"tiktok_{post_id}").splitlines()[0][:70]
         items = _image_items(images, title, self.cdn_headers)
         music = (item.get("music") or {}).get("playUrl")
         if music:
@@ -420,6 +511,8 @@ def download_to(workdir, ticket):
         max_filesize=Config.MAX_DOWNLOAD_MB * 1024 * 1024,
         overwrites=True,
     )
+    if ticket.get("c"):
+        opts["extractor_args"] = {"youtube": {"player_client": ticket["c"]}}
     if ticket.get("i"):
         opts["noplaylist"] = False
         opts["playlist_items"] = str(ticket["i"])
