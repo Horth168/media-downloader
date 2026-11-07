@@ -51,7 +51,7 @@ export default function Settings() {
           </div>
         </div>
         <Toggle label="Analyze when I paste" hint="Look up the link as soon as you paste it." checked={prefs.autoAnalyze} onChange={(v) => setPrefs({ autoAnalyze: v })} />
-        <Toggle label="Use the share sheet on iPhone" hint="Lets you pick Save Video or Save Image to put files in Photos." checked={prefs.iosShareSheet} onChange={(v) => setPrefs({ iosShareSheet: v })} />
+        <Toggle label="Save to Photos on iPhone" hint="When a download finishes, show a Save to Photos button (opens Save Video / Save Image)." checked={prefs.iosShareSheet} onChange={(v) => setPrefs({ iosShareSheet: v })} />
         <Toggle label="Keep download history" hint="Stored only on this device." checked={prefs.keepHistory} onChange={(v) => setPrefs({ keepHistory: v })} />
       </Group>
 

@@ -115,6 +115,55 @@ def _to_mp3(src, out):
         raise ApiError("no_audio", "This file has no audio track that can be converted to MP3.", 422)
 
 
+def _probe_codecs(path):
+    """Return (video_codec, audio_codec) using ffmpeg's stream info."""
+    import re
+    proc = subprocess.run([_ffmpeg_exe(), "-hide_banner", "-nostdin", "-i", path],
+                          capture_output=True, timeout=60)
+    info = proc.stderr.decode(errors="ignore")
+    v = re.search(r"Stream #[^\n]*Video: (\w+)", info)
+    a = re.search(r"Stream #[^\n]*Audio: (\w+)", info)
+    return (v.group(1) if v else None), (a.group(1) if a else None)
+
+
+def make_phone_friendly(path, workdir):
+    """Return an MP4 that iPhone Photos, WhatsApp, Telegram etc. can all play.
+
+    H.264/HEVC video and AAC audio are copied as-is (fast); anything else (VP9, AV1,
+    Opus...) is converted. The moov atom goes to the front so playback starts at once.
+    """
+    v, a = _probe_codecs(path)
+    if v is None:
+        return path  # audio-only or unreadable: leave it alone
+    out = os.path.join(workdir, "final.mp4")
+    if v == "h264":
+        vargs = ["-c:v", "copy"]
+    elif v == "hevc":
+        vargs = ["-c:v", "copy", "-tag:v", "hvc1"]  # iOS only plays HEVC tagged hvc1
+    else:
+        vargs = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"]
+    if a is None:
+        aargs = []
+    elif a == "aac":
+        aargs = ["-c:a", "copy"]
+    else:
+        aargs = ["-c:a", "aac", "-b:a", "160k"]
+    cmd = [_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", path,
+           "-map", "0:v:0", "-map", "0:a:0?", *vargs, *aargs, "-movflags", "+faststart", out]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        raise ApiError("convert_timeout", "Converting the video for your phone took too long. "
+                                          "Try a lower quality.", 504)
+    if proc.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) == 0:
+        log.warning("phone-friendly conversion failed (%s/%s): %s", v, a,
+                    proc.stderr.decode(errors="ignore")[-400:])
+        return path
+    log.info("phone-friendly: %s/%s -> %s", v, a, "copied" if v in ("h264", "hevc") else "re-encoded")
+    os.remove(path)
+    return out
+
+
 def _stream_file(path, workdir, filename):
     """Stream a finished file, then delete its temp folder."""
     ext = os.path.splitext(path)[1].lstrip(".").lower()
@@ -180,6 +229,8 @@ def stream_platform(ticket):
             _to_mp3(path, out)
             os.remove(path)
             path = out
+        elif ticket["m"] == "video":
+            path = make_phone_friendly(path, workdir)
     except Exception:
         shutil.rmtree(workdir, ignore_errors=True)
         raise

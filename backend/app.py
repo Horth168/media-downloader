@@ -89,10 +89,19 @@ def _selftest(app):
             log.warning("SELFTEST %s -> OK %s, %d items: %s", url, m["kind"], len(m["items"]),
                         json.dumps([[it["type"], [f["id"] for f in it["formats"]]] for it in m["items"]])[:300])
             for it in m["items"][:4]:
-                for f in it["formats"][-1:] if it["type"] == "video" else it["formats"][:1]:
+                vids = [f for f in it["formats"] if f["id"].startswith("mp4")]
+                for f in (vids[-1:] if vids else it["formats"][:1]):  # smallest video quality is enough
                     d = client.get("/api/download?t=" + f["ticket"])
-                    log.warning("SELFTEST download %s -> %s %s %d bytes", f["filename"], d.status_code,
-                                d.headers.get("Content-Type"), len(d.data))
+                    codecs = ""
+                    if d.status_code == 200 and f["id"].startswith("mp4"):
+                        import tempfile
+                        from services.downloader import _probe_codecs
+                        with tempfile.NamedTemporaryFile(suffix=".mp4") as tmp:
+                            tmp.write(d.data)
+                            tmp.flush()
+                            codecs = "codecs=%s/%s" % _probe_codecs(tmp.name)
+                    log.warning("SELFTEST download %s -> %s %s %d bytes %s", f["filename"], d.status_code,
+                                d.headers.get("Content-Type"), len(d.data), codecs)
 
     threading.Thread(target=run, daemon=True).start()
 

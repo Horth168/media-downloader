@@ -5,6 +5,7 @@ import Downloads from './screens/Downloads'
 import History from './screens/History'
 import Settings from './screens/Settings'
 import Toast from './components/Toast'
+import ReadySheet from './components/ReadySheet'
 import { useApp } from './lib/AppContext'
 
 const TABS = [
@@ -85,6 +86,7 @@ export default function App() {
           </ul>
         </nav>
         <Toast />
+        <ReadySheet />
       </div>
     </div>
   )

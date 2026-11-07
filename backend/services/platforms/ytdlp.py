@@ -117,7 +117,8 @@ def friendly_error(platform_name, err):
 
 
 def _height_selector(h):
-    return (f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/"
+    # Prefer H.264 + AAC: plays everywhere, including iPhone Photos. Others get converted after download.
+    return (f"bv*[height<={h}][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<={h}][vcodec^=avc1]/"
             f"bv*[height<={h}]+ba/b[height<={h}]/b")
 
 
@@ -207,7 +208,7 @@ class YtdlpPlatform(Platform):
             if top and top not in QUALITIES and top < 1080 and top not in levels:
                 levels = [top] + levels[:2]
             for h in levels:
-                sel = _height_selector(h) if h else "b/bv*+ba"
+                sel = _height_selector(h) if h else "b[vcodec^=avc1]/bv*[vcodec^=avc1]+ba/b/bv*+ba"
                 label_q = f"{h}p" if h else "Best available"
                 out.append(self._fmt(f"mp4-{h or 'best'}", "MP4 Video", label_q, "mp4",
                                      _estimate_size(formats, h) if h else None,
@@ -570,6 +571,7 @@ def download_to(workdir, ticket):
         ffmpeg_location=ffmpeg_dir(),
         max_filesize=Config.MAX_DOWNLOAD_MB * 1024 * 1024,
         overwrites=True,
+        format_sort=["vcodec:h264", "acodec:aac"],
     )
     if ticket.get("c"):
         opts["extractor_args"] = {"youtube": {"player_client": ticket["c"]}}

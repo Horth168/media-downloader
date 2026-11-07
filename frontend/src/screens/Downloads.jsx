@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleAlert, Download, RotateCw, Trash2, X } from 'lucide-react'
+import { CheckCircle2, CircleAlert, Download, RotateCw, Share, Trash2, X } from 'lucide-react'
 import PlatformMark from '../components/PlatformMark'
 import { useApp } from '../lib/AppContext'
 import { formatBytes } from '../lib/platforms'
@@ -38,7 +38,7 @@ export default function Downloads({ go }) {
 }
 
 function JobRow({ job }) {
-  const { cancel, retry, dismiss } = useApp()
+  const { cancel, retry, dismiss, saveReady } = useApp()
   const active = ['queued', 'downloading', 'saving'].includes(job.status)
   const pct = job.total && job.loaded ? Math.min(100, Math.round((job.loaded / job.total) * 100)) : null
   const isZip = job.kind === 'zip'
@@ -51,6 +51,7 @@ function JobRow({ job }) {
       ? `${job.loaded} of ${job.total} files`
       : pct != null ? `${formatBytes(job.loaded)} of ${formatBytes(job.total)}` : `${formatBytes(job.loaded) || '0 B'} downloaded`
   } else if (job.status === 'saving') line = isZip ? 'Building ZIP…' : 'Saving to your device…'
+  else if (job.status === 'ready') line = `${formatBytes(job.size)}, ready to save`
   else if (job.status === 'done') line = `${formatBytes(job.size)}, ${job.savedVia === 'shared' ? 'shared' : 'saved'}`
   else if (job.status === 'cancelled') line = 'Cancelled'
   else line = job.error
@@ -65,6 +66,9 @@ function JobRow({ job }) {
             {job.format}: {line}
           </p>
         </div>
+        {job.status === 'ready' && (
+          <button onClick={() => saveReady(job.id)} className="btn-ghost focus-ring bg-violet/20 text-sm text-fg"><Share size={16} /> Save</button>
+        )}
         {job.status === 'done' && <CheckCircle2 size={22} className="text-ok" aria-label="Done" />}
         {job.status === 'failed' && <CircleAlert size={22} className="text-bad" aria-label="Failed" />}
         {active && job.status !== 'saving' && (

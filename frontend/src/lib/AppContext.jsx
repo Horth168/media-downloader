@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import { api, ApiError } from './api'
-import { saveBlob } from './save'
+import { canShareFile, saveBlob } from './save'
 import { addHistory, clearHistory, loadHistory, loadPrefs, removeHistory, savePrefs } from './storage'
 
 const Ctx = createContext(null)
@@ -43,6 +43,8 @@ export function AppProvider({ children }) {
   const [jobs, setJobs] = useState([])
   const [toast, setToast] = useState(null)
   const controllers = useRef(new Map())
+  const blobs = useRef(new Map())
+  const [readyId, setReadyId] = useState(null)
 
   const setPrefs = useCallback((patch) => {
     setPrefsState((p) => { const n = { ...p, ...patch }; savePrefs(n); return n })
@@ -57,7 +59,21 @@ export function AppProvider({ children }) {
     return () => clearTimeout(t)
   }, [toast])
 
+  const jobsRef = useRef(jobs)
+  jobsRef.current = jobs
   const patchJob = (id, patch) => setJobs((js) => js.map((j) => (j.id === id ? { ...j, ...patch } : j)))
+
+  const finish = useCallback((job, size, how) => {
+    patchJob(job.id, { status: 'done', size, savedVia: how })
+    notify(how === 'shared' ? 'Saved' : how === 'cancelled' ? 'Not saved. Tap Save again any time.' : `Saved ${job.filename}`,
+      how === 'cancelled' ? 'info' : 'ok')
+    if (prefs.keepHistory && how !== 'cancelled') {
+      setHistory(addHistory({
+        id: job.id, title: job.title, platform: job.platform, format: job.format,
+        filename: job.filename, size, thumbnail: job.thumbnail, sourceUrl: job.sourceUrl, at: Date.now(),
+      }))
+    }
+  }, [notify, prefs.keepHistory])
 
   const run = useCallback(async (job) => {
     const ctrl = new AbortController()
@@ -82,14 +98,15 @@ export function AppProvider({ children }) {
           patchJob(job.id, { loaded, total }))
         patchJob(job.id, { status: 'saving' })
       }
-      const how = await saveBlob(blob, filename, { preferShare: prefs.iosShareSheet })
-      patchJob(job.id, { status: 'done', size: blob.size, savedVia: how })
-      notify(how === 'cancelled' ? 'Download ready — saving was cancelled.' : `Saved ${filename}`, 'ok')
-      if (prefs.keepHistory) {
-        setHistory(addHistory({
-          id: job.id, title: job.title, platform: job.platform, format: job.format,
-          filename, size: blob.size, thumbnail: job.thumbnail, sourceUrl: job.sourceUrl, at: Date.now(),
-        }))
+      if (prefs.iosShareSheet && canShareFile(blob, filename)) {
+        // iOS only opens the share sheet straight after a tap, and a long download has
+        // used that up. Hold the file and let the person tap "Save to Photos".
+        blobs.current.set(job.id, blob)
+        patchJob(job.id, { status: 'ready', size: blob.size })
+        setReadyId(job.id)
+      } else {
+        const how = await saveBlob(blob, filename, { preferShare: false })
+        finish(job, blob.size, how)
       }
     } catch (e) {
       if (e.name === 'AbortError') {
@@ -101,7 +118,23 @@ export function AppProvider({ children }) {
     } finally {
       controllers.current.delete(job.id)
     }
-  }, [notify, prefs.iosShareSheet, prefs.keepHistory])
+  }, [notify, finish, prefs.iosShareSheet])
+
+  // Called from a tap, so iOS allows the share sheet ("Save Video" / "Save Image").
+  const saveReady = useCallback(async (id) => {
+    const job = jobsRef.current.find((j) => j.id === id)
+    const blob = blobs.current.get(id)
+    setReadyId(null)
+    if (!job || !blob) return
+    const how = await saveBlob(blob, job.filename, { preferShare: true })
+    if (how === 'cancelled') {
+      patchJob(id, { status: 'ready' })
+      notify('Not saved. Tap Save to Photos again any time.')
+      return
+    }
+    blobs.current.delete(id)
+    finish(job, blob.size, how)
+  }, [finish, notify])
 
   const startDownload = useCallback((spec) => {
     const job = { id: newId(), status: 'queued', loaded: 0, total: 0, createdAt: Date.now(), ...spec }
@@ -111,19 +144,23 @@ export function AppProvider({ children }) {
   }, [run])
 
   const cancel = useCallback((id) => controllers.current.get(id)?.abort(), [])
-  const jobsRef = useRef(jobs)
-  jobsRef.current = jobs
   const retry = useCallback((id) => {
     const job = jobsRef.current.find((j) => j.id === id)
     if (job && !controllers.current.has(id)) run(job)
   }, [run])
-  const dismiss = useCallback((id) => setJobs((js) => js.filter((j) => j.id !== id)), [])
-  const clearFinished = useCallback(() => setJobs((js) => js.filter((j) => ['queued', 'downloading', 'saving'].includes(j.status))), [])
+  const dismiss = useCallback((id) => { blobs.current.delete(id); setJobs((js) => js.filter((j) => j.id !== id)) }, [])
+  const clearFinished = useCallback(() => setJobs((js) => js.filter((j) => {
+    const keep = ['queued', 'downloading', 'saving', 'ready'].includes(j.status)
+    if (!keep) blobs.current.delete(j.id)
+    return keep
+  })), [])
 
   const value = {
     prefs, setPrefs,
     history, clearHistory: () => setHistory(clearHistory()), removeHistory: (id) => setHistory(removeHistory(id)),
-    jobs, startDownload, cancel, retry, dismiss, clearFinished,
+    jobs, startDownload, cancel, retry, dismiss, clearFinished, saveReady,
+    readyJob: jobs.find((j) => j.id === readyId && j.status === 'ready') || null,
+    dismissReady: () => setReadyId(null),
     toast, notify,
   }
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
